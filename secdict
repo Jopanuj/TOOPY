@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+import argparse
+import os
+import sqlite3
+import sys
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+DB_PATH = os.path.join(BASE_DIR, "db", "secdict.db")
+
+C_RESET = "\033[0m"
+C_BOLD = "\033[1m"
+C_CYAN = "\033[36m"
+C_GREEN = "\033[32m"
+C_YELLOW = "\033[33m"
+C_DIM = "\033[90m"
+
+
+def ensure_db():
+    if not os.path.exists(DB_PATH):
+        builder = os.path.join(BASE_DIR, "scripts", "build_dataset.py")
+        print("Initializing local SQLite database from repository shards...")
+        os.system(f"{sys.executable} {builder} --from-shards")
+
+
+def show_stats(conn):
+    cur = conn.cursor()
+    total = cur.execute("SELECT count(*) FROM items;").fetchone()[0]
+    print(f"{C_BOLD}secdict database statistics:{C_RESET}")
+    print(f"  Total indexed entries: {C_GREEN}{total:,}{C_RESET}\n")
+    rows = cur.execute("SELECT kind, count(*) as c FROM items GROUP BY kind ORDER BY c DESC;").fetchall()
+    for kind, cnt in rows:
+        print(f"  - {kind:<12} {cnt:>10,}")
+
+
+def search_db(conn, query_terms, kind_filter, limit):
+    cur = conn.cursor()
+    safe_tokens = []
+    for t in query_terms:
+        clean = "".join(ch for ch in t if ch.isalnum() or ch in ("-", "_"))
+        if clean:
+            safe_tokens.append(f'"{clean}"*')
+
+    fts_query = " AND ".join(safe_tokens)
+    if not fts_query:
+        print("Provide a valid search keyword.")
+        return
+
+    sql = "SELECT name, kind, category, summary, cmd, tags, ref FROM items WHERE items MATCH ?"
+    params = [fts_query]
+
+    if kind_filter:
+        sql += " AND kind = ?"
+        params.append(kind_filter)
+
+    sql += " LIMIT ?;"
+    params.append(limit)
+
+    rows = cur.execute(sql, params).fetchall()
+    if not rows:
+        print(f"No matches found for: {' '.join(query_terms)}")
+        return
+
+    print(f"{C_DIM}Showing {len(rows)} result(s):{C_RESET}\n")
+    for idx, (name, kind, cat, summary, cmd, tags, ref) in enumerate(rows, 1):
+        print(f"{C_BOLD}{idx}. {C_CYAN}{name}{C_RESET} {C_YELLOW}[{kind} / {cat}]{C_RESET}")
+        print(f"   {summary}")
+        print(f"   {C_GREEN}$ {cmd}{C_RESET}")
+        print(f"   {C_DIM}ref: {ref}{C_RESET}\n")
+
+
+def interactive_loop(conn):
+    print(f"{C_BOLD}secdict interactive shell{C_RESET} (type 'stats' for counts, 'q' to quit)")
+    while True:
+        try:
+            line = input(f"{C_CYAN}secdict>{C_RESET} ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if not line:
+            continue
+        if line.lower() in ("q", "quit", "exit"):
+            break
+        if line.lower() == "stats":
+            show_stats(conn)
+            continue
+        search_db(conn, line.split(), None, 25)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="secdict",
+        description="Command-line search index for security tools, exploits, modules, and CVEs."
+    )
+    parser.add_argument("query", nargs="*", help="Keywords, tool name, CVE ID, or protocol")
+    parser.add_argument("-t", "--type", choices=["tool", "exploit", "shellcode", "msf", "nuclei", "cve"], help="Filter by record type")
+    parser.add_argument("-n", "--limit", type=int, default=25, help="Max results to display")
+    parser.add_argument("-i", "--interactive", action="store_true", help="Launch interactive search prompt")
+    parser.add_argument("--stats", action="store_true", help="Show total indexed counts by type")
+    parser.add_argument("--sync", action="store_true", help="Rebuild dataset from upstream feeds")
+
+    args = parser.parse_args()
+
+    if args.sync:
+        builder = os.path.join(BASE_DIR, "scripts", "build_dataset.py")
+        os.execv(sys.executable, [sys.executable, builder])
+
+    ensure_db()
+    conn = sqlite3.connect(DB_PATH)
+
+    if args.stats:
+        show_stats(conn)
+    elif args.interactive:
+        interactive_loop(conn)
+    elif args.query:
+        search_db(conn, args.query, args.type, args.limit)
+    else:
+        parser.print_help()
+
+    conn.close()
+
+
+if __name__ == "__main__":
+    main()
